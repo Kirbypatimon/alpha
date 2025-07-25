@@ -1,125 +1,114 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import asyncio
 import os
-from datetime import timedelta
-from dotenv import load_dotenv
 
 intents = discord.Intents.default()
-intents.members = True
 intents.message_content = True
 intents.messages = True
 intents.guilds = True
-
-load_dotenv()
-TOKEN = os.getenv("TOKEN")
+intents.members = True
+intents.bans = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+TOKEN = os.getenv("TOKEN")
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 
-# --- ログ機能（常時実行） ---
-@bot.event
-async def on_message_edit(before, after):
-    if before.author.bot:
-        return
-    embed = discord.Embed(title="メッセージ編集", color=discord.Color.orange())
-    embed.add_field(name="ユーザー", value=before.author.mention)
-    embed.add_field(name="チャンネル", value=before.channel.mention)
-    embed.add_field(name="編集前", value=before.content or "空")
-    embed.add_field(name="編集後", value=after.content or "空")
-    await before.channel.send(embed=embed)
-
-@bot.event
-async def on_message_delete(message):
-    if message.author.bot:
-        return
-    embed = discord.Embed(title="メッセージ削除", color=discord.Color.red())
-    embed.add_field(name="ユーザー", value=message.author.mention)
-    embed.add_field(name="チャンネル", value=message.channel.mention)
-    embed.add_field(name="内容", value=message.content or "空")
-    await message.channel.send(embed=embed)
-
-# --- コマンド登録 ---
 @bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"Bot起動: {bot.user}")
-
-# --- /ban コマンド ---
-@tree.command(name="ban", description="ユーザーをBANします")
-@app_commands.describe(userid="ユーザーID", reason="理由", delete_message_days="true / false / 日数(例: 1d)")
-async def ban_user(interaction: discord.Interaction, userid: str, reason: str, delete_message_days: str):
+    print(f"{bot.user} でログインしました")
     try:
-        user = await bot.fetch_user(int(userid))
-        delete_days = 0
-        if delete_message_days.lower() == "true":
-            delete_days = 1
-        elif delete_message_days.lower().endswith("d"):
-            delete_days = int(delete_message_days[:-1])
-        elif delete_message_days.lower() == "false":
-            delete_days = 0
-
-        await interaction.guild.ban(user, reason=reason, delete_message_days=delete_days)
-        await interaction.response.send_message(f"{user} をBANしました。理由: {reason}", ephemeral=True)
+        synced = await bot.tree.sync()
+        print(f"スラッシュコマンドを {len(synced)} 個同期しました")
     except Exception as e:
-        await interaction.response.send_message(f"BANに失敗: {e}", ephemeral=True)
+        print(f"スラッシュコマンド同期失敗: {e}")
 
-# --- /kick コマンド ---
-@tree.command(name="kick", description="ユーザーをキックします")
-@app_commands.describe(userid="ユーザーID")
-async def kick_user(interaction: discord.Interaction, userid: str):
+# /timeout コマンド
+@bot.tree.command(name="timeout")
+@app_commands.describe(user="タイムアウトするユーザー", duration="タイムアウト時間 (例: 10s, 5m, 1h, 1d)", reason="理由")
+async def timeout(interaction: discord.Interaction, user: discord.Member, duration: str, reason: str = "理由なし"):
+    if not interaction.user.guild_permissions.moderate_members:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+    
+    seconds = convert_to_seconds(duration)
+    if seconds is None:
+        await interaction.response.send_message("時間の形式が不正です（例: 10s, 5m, 1h, 1d）", ephemeral=True)
+        return
+
+    await user.timeout(discord.utils.utcnow() + discord.timedelta(seconds=seconds), reason=reason)
+    await interaction.response.send_message(f"{user.mention} をタイムアウトしました（{duration}）: {reason}")
+
+# /kick コマンド
+@bot.tree.command(name="kick")
+@app_commands.describe(user="キックするユーザー", reason="理由")
+async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+    await user.kick(reason=reason)
+    await interaction.response.send_message(f"{user.mention} をキックしました: {reason}")
+
+# /ban コマンド
+@bot.tree.command(name="ban")
+@app_commands.describe(user="BANするユーザー", reason="理由", delete_message_days="過去メッセージ削除（0〜7日）")
+async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし", delete_message_days: int = 0):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+    await user.ban(reason=reason, delete_message_days=delete_message_days)
+    await interaction.response.send_message(f"{user.mention} をBANしました（過去{delete_message_days}日分のメッセージ削除）: {reason}")
+
+# /unban コマンド
+@bot.tree.command(name="unban")
+@app_commands.describe(user_id="BAN解除するユーザーID")
+async def unban(interaction: discord.Interaction, user_id: str):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+
     try:
-        member = await interaction.guild.fetch_member(int(userid))
-        await member.kick(reason="Kickコマンドによる実行")
-        await interaction.response.send_message(f"{member} をキックしました", ephemeral=True)
+        banned_users = await interaction.guild.bans()
+        user = discord.utils.get(banned_users, user__id=int(user_id))
+        if user:
+            await interaction.guild.unban(user.user)
+            await interaction.response.send_message(f"{user.user.name} をBAN解除しました")
+        else:
+            await interaction.response.send_message("そのユーザーはBANされていません", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"キック失敗: {e}", ephemeral=True)
+        await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
 
-# --- /timeout コマンド ---
-@tree.command(name="timeout", description="ユーザーをタイムアウトします")
-@app_commands.describe(userid="ユーザーID", duration="例: 10s, 5m, 2h, 1d", reason="理由")
-async def timeout_user(interaction: discord.Interaction, userid: str, duration: str, reason: str):
+# /user コマンド
+@bot.tree.command(name="user")
+@app_commands.describe(user_id="確認したいユーザーID")
+async def user(interaction: discord.Interaction, user_id: str):
     try:
-        member = await interaction.guild.fetch_member(int(userid))
-        seconds = int(duration[:-1])
-        unit = duration[-1]
-
-        delta = {
-            's': timedelta(seconds=seconds),
-            'm': timedelta(minutes=seconds),
-            'h': timedelta(hours=seconds),
-            'd': timedelta(days=seconds)
-        }.get(unit)
-
-        if not delta:
-            raise ValueError("時間形式が無効です (例: 10s, 5m, 2h, 1d)")
-
-        await member.timeout(delta, reason=reason)
-        await interaction.response.send_message(f"{member} を {duration} タイムアウトしました", ephemeral=True)
+        member = await interaction.guild.fetch_member(int(user_id))
+        roles = [role.name for role in member.roles if role.name != "@everyone"]
+        embed = discord.Embed(title=f"ユーザー情報: {member.name}", color=discord.Color.blue())
+        embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
+        embed.add_field(name="ID", value=member.id, inline=False)
+        embed.add_field(name="ユーザーネーム", value=member.global_name or "なし", inline=False)
+        embed.add_field(name="登録日", value=member.created_at.strftime('%Y-%m-%d %H:%M:%S'), inline=False)
+        embed.add_field(name="ロール", value=", ".join(roles) if roles else "なし", inline=False)
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await interaction.response.send_message(f"タイムアウト失敗: {e}", ephemeral=True)
+        await interaction.response.send_message(f"ユーザー情報を取得できませんでした: {e}", ephemeral=True)
 
-# --- /unban コマンド ---
-@tree.command(name="unban", description="ユーザーのBANを解除します")
-@app_commands.describe(userid="ユーザーID")
-async def unban_user(interaction: discord.Interaction, userid: str):
-    try:
-        user = await bot.fetch_user(int(userid))
-        await interaction.guild.unban(user)
-        await interaction.response.send_message(f"{user} のBANを解除しました", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"BAN解除失敗: {e}", ephemeral=True)
+# /log コマンド
+@bot.tree.command(name="log")
+async def log(interaction: discord.Interaction):
+    await interaction.response.send_message("このチャンネルがログ出力先です")
+    global LOG_CHANNEL_ID
+    LOG_CHANNEL_ID = interaction.channel.id
 
-# --- /user コマンド ---
-@tree.command(name="user", description="ユーザー情報を表示します")
-@app_commands.describe(userid="ユーザーID")
-async def user_info(interaction: discord.Interaction, userid: str):
-    try:
-        member = await interaction.guild.fetch_member(int(userid))
-        embed = discord.Embed(title="ユーザー情報", color=discord.Color.green())
-        embed.add_field(name="名前", value=member.name, inline=True)
-        embed.add_field(name="ユーザー名", value=member.display_name, inline=True)
-        embed.add_field(name="ユーザーID", value=member.id, inline=False)
-        embed.add_field(name="登録日", value=member.created_at.strftime('%Y/%m/%d %H:%M:%S'), inline=False)
-        roles = [role.name for role in member.roles if ro
+# メッセージ削除時ログ
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or message.guild is None:
+        return
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        embed = discord.Embed(title="メッセージ削除", color=discord.Color.red())
+        embed.add_field(name="ユーザー", value=f"{message.author} ({message.author.id})", inline=False)
+        embed.add_field(name="内容", value=message.content or "（ファイル/埋め込みのみ）", inli
